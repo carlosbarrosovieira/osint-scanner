@@ -1,3 +1,6 @@
 requests
 colorama
+pysocks
 holehe
+dnspython
+phonenumbers
