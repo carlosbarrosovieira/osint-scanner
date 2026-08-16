@@ -1,11 +1,11 @@
 # 🔍 OSINT Threat Intelligence Scanner
 
-An Open Source Intelligence (OSINT) and Threat Intelligence tool developed in Python, specifically optimised to run on Android terminals via Termux.
+An Open Source Intelligence (OSINT) and Threat Intelligence tool developed in Python, specifically optimised to run on Android terminals via Termux. Focused on digital identities: profiles, usernames, accounts, phone numbers, emails and leaked passwords.
 
 ## 📋 Table of Contents
 
 - [About the Project](#-about-the-project)
-- [What's New in V1.2.0](#-whats-new-in-v120)
+- [What's New in V1.3.0](#-whats-new-in-v130)
 - [Key Features](#-key-features)
 - [Installation](#-installation)
 - [Usage](#-usage)
@@ -14,29 +14,24 @@ An Open Source Intelligence (OSINT) and Threat Intelligence tool developed in Py
 
 ## 📄 About the Project
 
-This tool focuses on the investigation of digital profiles: emails, usernames, phone numbers, domains, and leaked passwords. It aggregates multiple free APIs and scraping techniques into a single, lightweight terminal interface, automatically verifies its own environment at startup, and concludes every investigation with an aggregated Digital Exposure Score.
+This tool focuses on the investigation of digital identities: profiles, usernames, accounts, phone numbers, emails, and leaked passwords. It aggregates multiple free APIs and scraping techniques into a single, lightweight terminal interface, automatically verifies its own environment at startup, and concludes every investigation with an aggregated Digital Exposure Score.
 
-## 🆕 What's New in V1.2.0
+## 🆕 What's New in V1.3.0
 
-- **SQLite response cache with TTL** — platform checks, DNS lookups and supported API responses are cached locally, making repeated investigations of the same target dramatically faster.
-- **Network hardening** — thread-safe rate limiting (protects rate-limited APIs such as EmailRep), real browser User-Agent rotation, and exponential backoff retries.
-- **Email DNS & spoofing analysis (keyless)** — MX record resolution (detects addresses that cannot receive mail) plus SPF, DKIM and DMARC checks to grade the domain's spoofing risk.
-- **Offline phone intelligence** — number parsing with the `phonenumbers` library: validity, country, carrier, approximate location and line type (mobile/fixed/VoIP), with no API keys and no network calls.
-- **Domain security headers audit (keyless)** — checks HSTS, Content-Security-Policy, X-Content-Type-Options, X-Frame-Options and Referrer-Policy over HTTPS, with a 0–100 security score.
-- **JSON report export** — every investigation now saves a structured `.json` report alongside the plain-text one, with machine-readable results per module.
-- **Digital Exposure Score** — an aggregated 0–100 score (LOW/MEDIUM/HIGH) combining footprint size, leak exposure, dark web leads and fake-profile indicators, with a full breakdown of contributing factors.
+- **Identity-focused scope** — the pipeline now targets profiles, usernames, accounts, phone numbers, emails and passwords only; the domain investigation module (crt.sh subdomains, security headers) has been removed.
+- **Digital Exposure Score fix** — found profile URLs are now correctly counted towards the score.
 
 ## ⭐ Key Features
 
 - **Auto-Updating DB** — automatically downloads the latest list of 400+ social networks from the Sherlock Project (cached for 7 days).
 - **⚡ Performance & Stealth** — SQLite response cache, request rate limiting, User-Agent rotation and exponential backoff retries.
 - **📧 Email OSINT** — Holehe, Gravatar (profile picture and real name), EmailRep (reputation check), DNS analysis (MX/SPF/DKIM/DMARC spoofing risk), and Google Dorks.
-- **👤 Username OSINT** — simultaneous checking across 400+ sites using threading, Namechk, and Wayback Machine history.
+- **👤 Username/Account OSINT** — simultaneous checking across 400+ sites using threading, Namechk, and Wayback Machine history.
 - **📱 Phone OSINT** — offline number analysis (validity, country, carrier, line type), plus direct links for WhatsApp, Telegram, Truecaller, and tailored Google Dorks.
-- **🌐 Domain OSINT** — subdomain discovery via certificate transparency (crt.sh) and a keyless HTTP security headers audit (HSTS, CSP and more).
+- **🔑 Password Check** — Have I Been Pwned verification using k-anonymity (only 5 characters of the hash ever leave your device).
 - **🕵️ Fake Profile Scanner** — heuristic risk scoring (0–100) for fake, throwaway or bot accounts, including Shannon entropy analysis.
 - **🌑 Dark Web Scan** — Ahmia.fi search with automatic Tor routing when a Tor client is available.
-- **🔍 Leak & Threat Intel** — Pastebin scraping, GitHub code search, and HIBP password check (k-anonymity).
+- **🔍 Leak & Account Exposure** — Pastebin scraping, GitHub code search, and free breach previews.
 - **🧮 Digital Exposure Score** — aggregated assessment across all modules with a contributing-factors breakdown.
 - **📋 Report Management** — automatically generates clean `.txt` and structured `.json` files for each analysis, including the Tor status.
 
@@ -77,7 +72,7 @@ To start the application, run:
 python osint_mobile.py
 ```
 
-On first launch you may optionally provide an IntelX API key (get one at [intelx.io](https://intelx.io)); press Enter to skip. Then simply choose **Search** from the menu and enter a target: an email address, username, phone number, domain, or password. Every investigation ends with a Digital Exposure Score and is saved as a timestamped `.txt` report plus a structured `.json` report, both viewable from the **Manage Reports** menu.
+On first launch you may optionally provide an IntelX API key (get one at [intelx.io](https://intelx.io)); press Enter to skip. Then simply choose **Search** from the menu and enter a target: an email address, username, phone number, or password. Every investigation ends with a Digital Exposure Score and is saved as a timestamped `.txt` report plus a structured `.json` report, both viewable from the **Manage Reports** menu.
 
 ## 🤝 Contributing
 
