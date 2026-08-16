@@ -36,7 +36,7 @@ Module	Description
     pip install requests colorama holehe
 
 **4 - Clone this repository:**
-    git clone https://github.com/scartPT/osint-scanner.git
+    git clone https://github.com/sscartPT/osint-scanner.git
     cd osint-scanner
 
 **💻 Usage**
