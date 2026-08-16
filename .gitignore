@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info
+
+# Application: configuration and keys
+config.json
+
+# Application: caches
+platforms_cache.json
+cache/
+
+# Application: investigation reports
+report_*.txt
+report_*.json
