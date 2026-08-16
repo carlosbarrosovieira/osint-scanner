@@ -1,5 +1,11 @@
-cat << 'EOF' > osint_mobile.py
 #!/usr/bin/env python3
+# ============================================================================
+# OSINT THREAT INTELLIGENCE
+# A modular OSINT (Open-Source Intelligence) tool for investigating digital
+# identities: emails, usernames, phone numbers, domains and passwords.
+# Uses only public, legal sources (Sherlock, Holehe, HIBP, Ahmia, crt.sh).
+# ============================================================================
+
 import os
 import sys
 import subprocess
@@ -18,33 +24,73 @@ init(autoreset=True)
 
 # ============================================================
 # CONFIGURATION AND INITIALISATION
+# This module loads the API keys from config.json, creating the file
+# with default values on first run. It also holds the global state:
+# report_buffer (lines destined for the .txt report) and platforms_db
+# (the auto-updated database of websites to check usernames against).
 # ============================================================
 
 ANSI_RE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
 def load_config():
+    """Load API keys from config.json. The IntelX key is a personal credential
+    issued by intelligencex.io — it cannot be generated locally. It may be set
+    via the INTELX_KEY environment variable or edited into config.json;
+    the file is created empty on first run so no secret ships in the code."""
     config_file = 'config.json'
     if not os.path.exists(config_file):
-        config = {"intelx_key": "a8dcda2c-ba08-4fd4-8a7c-f9a67f4e2e2a"}
         with open(config_file, 'w') as f:
-            json.dump(config, f, indent=4)
+            json.dump({"intelx_key": ""}, f, indent=4)
     try:
         with open(config_file, 'r') as f:
-            return json.load(f)
+            config = json.load(f)
     except:
-        return {"intelx_key": ""}
+        config = {"intelx_key": ""}
+    if os.environ.get("INTELX_KEY"):
+        config["intelx_key"] = os.environ["INTELX_KEY"]
+    return config
 
 config = load_config()
 report_buffer = []
 platforms_db = {}
 
 def log_print(text):
+    """Print to the console and store a colour-free copy for the report."""
     print(text)
     clean_text = ANSI_RE.sub('', text)
     report_buffer.append(clean_text)
 
+def prompt_for_intelx_key():
+    """Ask for the IntelX API key at startup if it is not set yet.
+    The key is a personal credential issued by intelligencex.io — it cannot
+    be generated locally. Pressing Enter skips the prompt; a valid key is
+    validated (UUID format) and saved to config.json for future runs."""
+    global config
+    if config.get("intelx_key"):
+        return
+    print(f"\n{Fore.CYAN}[?] IntelX API key not set.")
+    print(f"{Fore.WHITE}    Get one at https://intelx.io (account settings).")
+    key = input(f"{Fore.YELLOW}    Enter key (or press Enter to skip): {Fore.WHITE}").strip()
+    if not key:
+        print(f"{Fore.YELLOW}[ℹ️] Skipped — IntelX API features disabled.")
+        return
+    if not re.match(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$', key):
+        print(f"{Fore.RED}[!] That does not look like a valid IntelX key (UUID format expected). Not saved.")
+        return
+    config["intelx_key"] = key
+    try:
+        with open('config.json', 'w') as f:
+            json.dump(config, f, indent=4)
+        print(f"{Fore.GREEN}[✅] Key saved to config.json.")
+    except Exception as e:
+        print(f"{Fore.RED}[!] Could not save config.json: {e}")
+
 # ============================================================
 # UTILITIES AND DESIGN
+# Shared helpers used by every module: console formatting (boxes,
+# section headers, progress bars), resilient HTTP requests with
+# retries, timestamp formatting, and target-type detection (email,
+# domain, phone number or plain username).
 # ============================================================
 
 def print_dynamic_box(lines):
@@ -72,6 +118,7 @@ def print_progress(iteration, total, bar_length=25):
         print()
 
 def robust_http_get(url, headers=None, timeout=8, retries=3):
+    """GET request with automatic retries; returns None on failure."""
     for attempt in range(retries):
         try:
             return requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
@@ -101,6 +148,10 @@ def is_phone(target):
 
 # ============================================================
 # AUTO-UPDATING PLATFORM DATABASE + WATCHDOG
+# Downloads the latest website database from the Sherlock Project
+# (400+ platforms) and caches it locally for 7 days. On download
+# failure, falls back to a small built-in list of popular platforms.
+# Runs automatically at every application startup.
 # ============================================================
 
 def load_or_update_platforms(force=False):
@@ -170,6 +221,11 @@ def watchdog_platforms():
 
 # ============================================================
 # MODULE: PHONE
+# Generates manual investigation links for a phone number:
+# Google Dorks (documents, social networks, paste sites) and
+# messaging/caller-ID lookups (WhatsApp, Telegram, Truecaller,
+# Sync.me). These require the browser because such services
+# cannot be queried reliably from a script.
 # ============================================================
 
 def investigate_phone(number):
@@ -201,6 +257,11 @@ def investigate_phone(number):
 
 # ============================================================
 # MODULE: EMAIL
+# Full email investigation: associated accounts via Holehe
+# (password-recovery probing across ~120 websites), identity
+# metadata via Gravatar, reputation and leak exposure via
+# EmailRep, plus targeted Google Dorks for profiles, forums,
+# configuration files and server logs.
 # ============================================================
 
 def investigate_email(email):
@@ -286,7 +347,12 @@ def investigate_email(email):
         log_print(f"     {Fore.BLUE}{url}")
 
 # ============================================================
-# MODULE: USERNAME (AUTO-UPDATED DATABASE)
+# MODULE: USERNAME
+# Mass username check across 400+ platforms (Sherlock database).
+# Each platform is probed in parallel (25 threads); a profile is
+# reported when the response does not match the platform's known
+# "not found" signature (status code, error message or redirect
+# URL). Also generates Namechk and Wayback Machine history links.
 # ============================================================
 
 def check_platform_thread(name, data, username):
@@ -364,6 +430,9 @@ def investigate_username(username):
 
 # ============================================================
 # MODULE: DOMAIN
+# Domain investigation via certificate transparency: queries
+# crt.sh for all certificates issued for the domain and its
+# subdomains, revealing internal hostnames and forgotten services.
 # ============================================================
 
 def investigate_domain(domain):
@@ -392,6 +461,13 @@ def investigate_domain(domain):
 
 # ============================================================
 # MODULE: LEAKS & PASSWORDS
+# Searches for the target in public leak sources: GitHub code
+# search, Pastebin dumps (via psbdmp.ws API) and manual breach
+# previews (BreachDirectory, Intelligence X, Google Dorks for
+# exposed databases, configs and logs). Plain-text targets are
+# also checked against the Have I Been Pwned password range API
+# (k-anonymity: only the first 5 characters of the SHA-1 hash
+# are ever sent over the network).
 # ============================================================
 
 def check_password_pwned(password):
@@ -477,6 +553,13 @@ def investigate_leaks(target, target_type):
 
 # ============================================================
 # FAKE PROFILE SCANNER (HEURISTIC, SAFE)
+# Scores the likelihood that an identifier belongs to a fake,
+# throwaway or automated account, using purely local heuristics:
+# length, character mix, numeric sequences, separators, disposable
+# email domains, punycode domains, suspicious phone prefixes,
+# generic/bot keywords and Shannon entropy (random-looking names
+# typical of machine-generated accounts). Produces a 0-100 risk
+# score with LOW/MEDIUM/HIGH bands and lists every indicator.
 # ============================================================
 
 def fake_profile_scanner(target, target_type):
@@ -582,7 +665,14 @@ def fake_profile_scanner(target, target_type):
         log_print(f"  {Fore.GREEN}No strong indicators of fake/low-trust profile detected.")
 
 # ============================================================
-# MODULE: DARK WEB DEEP SCAN (CLEARNET GATEWAYS ONLY, LEGAL)
+# MODULE: DARK WEB DEEP SCAN (LEGAL SOURCES ONLY)
+# Searches the target on Ahmia.fi, the public search engine for
+# .onion services. When a Tor client is available, the query is
+# routed through Tor to Ahmia's own onion endpoint (deeper
+# results); otherwise it uses the clearnet endpoint and notes the
+# limitation in the report. Also lists manual gateway links
+# (Tor66) and free breach previews (IntelX, BreachDirectory,
+# HIBP) plus dark web-focused Google Dorks.
 # ============================================================
 
 def dark_web_scan(target, target_type, tor_port=None):
@@ -658,6 +748,10 @@ def dark_web_scan(target, target_type, tor_port=None):
 
 # ============================================================
 # TOR DETECTION & TOR-ROUTED REQUESTS
+# Detects a locally running Tor client by probing the standard
+# SOCKS5 ports (tor daemon: 9050; Tor Browser: 9150) and provides
+# tor_get(), an HTTP GET helper that routes requests through the
+# Tor network so .onion services can be reached safely.
 # ============================================================
 
 def check_tor_connection():
@@ -683,6 +777,11 @@ def tor_get(url, timeout=20, port=9050):
 
 # ============================================================
 # DEPENDENCY CHECKER (AUTO-INSTALL)
+# Verifies at startup that all required packages are importable
+# (requests, colorama, pysocks, holehe) and automatically installs
+# any missing ones via pip, then re-checks. In auto mode (startup)
+# it runs without any user interaction; in interactive mode it
+# also reports the Tor status and prompts before installing.
 # ============================================================
 
 REQUIRED_PACKAGES = [
@@ -765,6 +864,9 @@ def check_dependencies(auto=False):
 
 # ============================================================
 # REPORT MANAGEMENT
+# Sub-menu to browse the investigation reports (.txt) generated
+# in the current directory: view, delete individually or delete
+# all, with confirmation prompts before any destructive action.
 # ============================================================
 
 def manage_reports():
@@ -840,6 +942,8 @@ def manage_reports():
 
 # ============================================================
 # "ABOUT" SECTION
+# Informational screen describing the application's features,
+# modules and data sources. Displayed from the main menu.
 # ============================================================
 
 def show_about():
@@ -884,6 +988,11 @@ def show_about():
 
 # ============================================================
 # MAIN FUNCTION
+# Core investigation pipeline. Detects the Tor client, identifies
+# the target type (email, domain, phone or username), runs the
+# specialised module, then the shared modules (leaks, fake profile
+# scanner, dark web scan) and finally saves the .txt report with
+# a timestamped filename.
 # ============================================================
 
 def save_report(target):
@@ -945,6 +1054,11 @@ def investigate_all(target):
 
 # ============================================================
 # MENU
+# Application entry point. On startup it automatically checks and
+# installs dependencies, updates the platform database and reports
+# the Tor status, then presents the main menu (Search, Manage
+# Reports, About, Exit). Every investigation flows through
+# investigate_all() above.
 # ============================================================
 
 def main():
@@ -957,6 +1071,9 @@ def main():
 
     # Auto-update platform database
     watchdog_platforms()
+
+    # Ask for the IntelX key at startup if not yet configured
+    prompt_for_intelx_key()
 
     tor_port = check_tor_connection()
     if tor_port:
@@ -1004,4 +1121,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-EOF
