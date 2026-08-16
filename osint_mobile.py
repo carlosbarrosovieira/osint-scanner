@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # ============================================================================
 # OSINT THREAT INTELLIGENCE
-# A modular OSINT (Open-Source Intelligence) tool for investigating digital
-# identities: emails, usernames, phone numbers, domains and passwords.
-# Uses only public, legal sources (Sherlock, Holehe, HIBP, Ahmia, crt.sh).
+# A modular OSINT (Open-Source Intelligence) tool focused on digital
+# identities: profiles, usernames, accounts, phone numbers, emails
+# and leaked passwords.
+# Uses only public, legal sources (Sherlock, Holehe, HIBP, Ahmia).
 # ============================================================================
 
 import os
@@ -178,7 +179,7 @@ def prompt_for_intelx_key():
 # Shared helpers used by every module: console formatting (boxes,
 # section headers, progress bars), resilient HTTP requests with
 # retries, timestamp formatting, and target-type detection (email,
-# domain, phone number or plain username).
+# phone number or plain username).
 # ============================================================
 
 def print_dynamic_box(lines):
@@ -599,7 +600,7 @@ def investigate_username(username):
                 found.append(result)
 
     print_progress(total, total)
-    json_results['username_found'] = re.findall(r'->\s*(https?://\S+)', '\n'.join(found))
+    json_results['username_found'] = re.findall(r'->\s*(https?://\S+)', ANSI_RE.sub('', '\n'.join(found)))
     if found:
         log_print(f"\n{Fore.GREEN}[+] PROFILES FOUND:\n")
         for s in found:
@@ -623,79 +624,14 @@ def investigate_username(username):
         log_print(f"     {Fore.BLUE}{url}")
 
 # ============================================================
-# MODULE: DOMAIN
-# Domain investigation via certificate transparency: queries
-# crt.sh for all certificates issued for the domain and its
-# subdomains, revealing internal hostnames and forgotten
-# services. Complemented by a keyless HTTP security-headers
-# check (HSTS, CSP, X-Frame-Options, etc.).
-# ============================================================
-
-def check_domain_security(domain):
-    """HTTP security headers check — no API keys needed."""
-    checks = {
-        'Strict-Transport-Security': ('HSTS missing', 15),
-        'Content-Security-Policy': ('CSP missing', 10),
-        'X-Content-Type-Options': ('X-Content-Type-Options missing', 5),
-        'X-Frame-Options': ('X-Frame-Options missing', 5),
-        'Referrer-Policy': ('Referrer-Policy missing', 5),
-    }
-    result = {'score': 100, 'issues': []}
-    resp = robust_http_get(f"https://{domain}", timeout=10, retries=1)
-    if not resp or resp.status_code >= 400:
-        result['note'] = 'site unreachable over HTTPS'
-        return result
-    for header, (message, penalty) in checks.items():
-        if header not in resp.headers:
-            result['issues'].append(message)
-            result['score'] -= penalty
-    return result
-
-def investigate_domain(domain):
-    print_section(f"🌐 DOMAIN INVESTIGATION: {domain}")
-    resp = robust_http_get(f'https://crt.sh/?q=%25.{domain}&output=json', timeout=12, retries=2)
-    if resp and resp.status_code == 200:
-        try:
-            data = resp.json()
-            subdomains = set()
-            for item in data:
-                name = item.get('name_value', '')
-                for n in name.split('\n'):
-                    n = n.replace('*.', '').strip()
-                    if n:
-                        subdomains.add(n)
-            if subdomains:
-                log_print(f"\n  {Fore.GREEN}[✅]{Fore.WHITE} [crt.sh] {Fore.CYAN}[Subdomains]{Fore.WHITE} -> {Fore.YELLOW}Found {len(subdomains)} records:")
-                for sub in list(subdomains)[:15]:
-                    log_print(f"     {Fore.YELLOW}- {sub}")
-            else:
-                log_print(f"\n{Fore.RED}  [❌] No subdomains found.")
-            json_results['domain_subdomains'] = len(subdomains)
-        except:
-            log_print(f"\n{Fore.RED}  [❌] Error in crt.sh.")
-    else:
-        log_print(f"\n{Fore.RED}  [❌] No certificates found.")
-
-    print_section("🛡️ SECURITY HEADERS (HSTS/CSP)")
-    sec = check_domain_security(domain)
-    json_results['domain_security'] = sec
-    if 'note' in sec:
-        log_print(f"  {Fore.YELLOW}[ℹ️] {sec['note']}.")
-    else:
-        scolor = Fore.GREEN if sec['score'] >= 70 else Fore.YELLOW if sec['score'] >= 40 else Fore.RED
-        log_print(f"  {Fore.WHITE}Security score: {scolor}{sec['score']}/100")
-        for issue in sec['issues'][:5]:
-            log_print(f"     {Fore.YELLOW}⚠️ {issue}")
-
-# ============================================================
-# MODULE: LEAKS & PASSWORDS
+# MODULE: LEAKS, PASSWORDS & ACCOUNT EXPOSURE
 # Searches for the target in public leak sources: GitHub code
 # search, Pastebin dumps (via psbdmp.ws API) and manual breach
-# previews (BreachDirectory, Intelligence X, Google Dorks for
-# exposed databases, configs and logs). Plain-text targets are
-# also checked against the Have I Been Pwned password range API
-# (k-anonymity: only the first 5 characters of the SHA-1 hash
-# are ever sent over the network).
+# previews (BreachDirectory, Intelligence X, Google Dorks) to
+# assess whether the account or identifier has been exposed.
+# Plain-text targets are also checked against the Have I Been
+# Pwned password range API (k-anonymity: only the first 5
+# characters of the SHA-1 hash are ever sent over the network).
 # ============================================================
 
 def check_password_pwned(password):
@@ -712,10 +648,6 @@ def check_password_pwned(password):
                 return True
     log_print(f"  {Fore.GREEN}[🛡️]{Fore.WHITE} [HIBP] {Fore.CYAN}[Password]{Fore.WHITE} -> {Fore.GREEN}Secure password.")
     return False
-
-def check_hudson_rock(target):
-    # Placeholder safe stub – no sensitive endpoints
-    log_print(f"  {Fore.YELLOW}[ℹ️]{Fore.WHITE} HudsonRock-like check skipped (study mode).")
 
 def check_free_credentials(target):
     print_section("🩸 PASSWORD SEARCH (FREE)")
@@ -785,10 +717,10 @@ def investigate_leaks(target, target_type):
 # Scores the likelihood that an identifier belongs to a fake,
 # throwaway or automated account, using purely local heuristics:
 # length, character mix, numeric sequences, separators, disposable
-# email domains, punycode domains, suspicious phone prefixes,
-# generic/bot keywords and Shannon entropy (random-looking names
-# typical of machine-generated accounts). Produces a 0-100 risk
-# score with LOW/MEDIUM/HIGH bands and lists every indicator.
+# email domains, suspicious phone prefixes, generic/bot keywords
+# and Shannon entropy (random-looking names typical of
+# machine-generated accounts). Produces a 0-100 risk score with
+# LOW/MEDIUM/HIGH bands and lists every indicator.
 # ============================================================
 
 def fake_profile_scanner(target, target_type):
@@ -834,15 +766,6 @@ def fake_profile_scanner(target, target_type):
         if re.search(r'\d{3,}', local):
             score += 10
             reasons.append("Numeric-heavy local part (possible autogenerated account).")
-
-    # Domain-specific heuristics
-    if is_domain(t):
-        if t.startswith("xn--"):
-            score += 25
-            reasons.append("Punycode domain (possible homograph attack / fake brand).")
-        if "-" in t:
-            score += 5
-            reasons.append("Hyphenated domain (sometimes used in fake clones).")
 
     # Phone-specific heuristics
     if is_phone(t):
@@ -1189,13 +1112,13 @@ def show_about():
         f"{Fore.WHITE}focused on digital profiles.",
         f"",
         f"{Fore.WHITE}Investigates emails, usernames,",
-        f"{Fore.WHITE}phone numbers, and passwords.",
+        f"{Fore.WHITE}phone numbers, accounts and passwords.",
         f"",
         f"{Fore.WHITE}SEARCH (Standard):",
         f"{Fore.GREEN}-{Fore.WHITE} Auto-updating 300+ sites (Sherlock)",
         f"{Fore.GREEN}-{Fore.WHITE} Email: Holehe, Gravatar, EmailRep",
-        f"{Fore.GREEN}-{Fore.WHITE} User: Namechk, Wayback Machine",
-        f"{Fore.GREEN}-{Fore.WHITE} Phone: WhatsApp, Truecaller, Dorks",
+        f"{Fore.GREEN}-{Fore.WHITE} Email DNS: MX/SPF/DKIM/DMARC",
+        f"{Fore.GREEN}-{Fore.WHITE} Phone: offline analysis + Dorks",
         f"{Fore.GREEN}-{Fore.WHITE} Leaks: Pastebin, GitHub (public only)",
         f"{Fore.GREEN}-{Fore.WHITE} Passwords: HIBP, Dorks",
         f"",
@@ -1203,14 +1126,15 @@ def show_about():
         f"{Fore.GREEN}-{Fore.WHITE} Fake Profile Scanner (heuristics)",
         f"{Fore.GREEN}-{Fore.WHITE} Entropy analysis (bot accounts)",
         f"{Fore.GREEN}-{Fore.WHITE} Dark Web Scan (Ahmia, legal sources)",
-        f"{Fore.GREEN}-{Fore.WHITE} Domains: crt.sh subdomain search",
         f"",
         f"{Fore.WHITE}ADVANCED SCAN (automatic):",
         f"{Fore.GREEN}-{Fore.WHITE} Detects Tor client (SOCKS5:9050)",
         f"{Fore.GREEN}-{Fore.WHITE} Tor ON: scans .onion services",
         f"{Fore.GREEN}-{Fore.WHITE} Tor OFF: clearnet mode + noted in report",
         f"",
-        f"{Fore.GREEN}-{Fore.WHITE} Auto-saves & manages .txt reports",
+        f"{Fore.GREEN}-{Fore.WHITE} SQLite cache + rate limiting",
+        f"{Fore.GREEN}-{Fore.WHITE} .txt + .json auto reports",
+        f"{Fore.GREEN}-{Fore.WHITE} Digital Exposure Score",
         f"",
         f"{Fore.WHITE}Open Source and Free.",
         f"",
@@ -1223,7 +1147,7 @@ def show_about():
 # ============================================================
 # MAIN FUNCTION
 # Core investigation pipeline. Detects the Tor client, identifies
-# the target type (email, domain, phone or username), runs the
+# the target type (email, phone or username/password), runs the
 # specialised module, then the shared modules (leaks, fake profile
 # scanner, dark web scan), computes the aggregated Digital
 # Exposure Score and finally saves the .txt and .json reports
@@ -1269,11 +1193,6 @@ def overall_assessment():
     if dns and not dns.get('mx', ['x']):
         score += 10
         reasons.append("Domain without MX records (+10)")
-
-    sec = json_results.get('domain_security', {})
-    if sec and sec.get('score', 100) < 70:
-        score += 10
-        reasons.append("Weak domain security headers (+10)")
 
     score = min(100, score)
     band = 'HIGH' if score >= 70 else 'MEDIUM' if score >= 40 else 'LOW'
@@ -1342,9 +1261,6 @@ def investigate_all(target):
     if is_email(target):
         investigate_email(target)
         target_type = "Email"
-    elif is_domain(target):
-        investigate_domain(target)
-        target_type = "Domain"
     elif is_phone(target):
         investigate_phone(target)
         target_type = "Phone"
@@ -1429,3 +1345,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+EOF
