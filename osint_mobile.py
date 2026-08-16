@@ -18,6 +18,9 @@ import re
 import concurrent.futures
 import glob
 import shutil
+import sqlite3
+import random
+import threading
 from colorama import init, Fore
 
 init(autoreset=True)
@@ -26,7 +29,8 @@ init(autoreset=True)
 # CONFIGURATION AND INITIALISATION
 # This module loads the API keys from config.json, creating the file
 # with default values on first run. It also holds the global state:
-# report_buffer (lines destined for the .txt report) and platforms_db
+# report_buffer (lines destined for the .txt report), json_results
+# (structured findings for the .json report) and platforms_db
 # (the auto-updated database of websites to check usernames against).
 # ============================================================
 
@@ -52,7 +56,91 @@ def load_config():
 
 config = load_config()
 report_buffer = []
+json_results = {}
 platforms_db = {}
+
+# ============================================================
+# NETWORK LAYER: CACHE, RATE LIMITING, USER AGENTS
+# SQLite response cache with per-entry TTL (speeds up repeated
+# investigations of the same target), a thread-safe rate limiter
+# to avoid API blocks, and User-Agent rotation to reduce
+# fingerprinting. All keyless and local.
+# ============================================================
+
+USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+]
+
+class Cache:
+    """SQLite cache with per-entry TTL. Returns None on miss or expiry."""
+
+    def __init__(self, cache_dir="cache"):
+        self.cache_dir = cache_dir
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            self.db_path = os.path.join(cache_dir, "cache.db")
+            conn = self._conn()
+            conn.execute('''CREATE TABLE IF NOT EXISTS cache
+                            (key TEXT PRIMARY KEY, value TEXT, timestamp INTEGER, ttl INTEGER)''')
+            conn.commit()
+            conn.close()
+            self.enabled = True
+        except Exception:
+            self.enabled = False
+
+    def _conn(self):
+        return sqlite3.connect(self.db_path)
+
+    def get(self, key):
+        if not self.enabled:
+            return None
+        try:
+            conn = self._conn()
+            row = conn.execute('SELECT value, timestamp, ttl FROM cache WHERE key = ?', (key,)).fetchone()
+            conn.close()
+            if row:
+                value, timestamp, ttl = row
+                if time.time() - timestamp < ttl:
+                    return json.loads(value)
+        except Exception:
+            pass
+        return None
+
+    def set(self, key, value, ttl=3600):
+        if not self.enabled:
+            return
+        try:
+            conn = self._conn()
+            conn.execute('INSERT OR REPLACE INTO cache (key, value, timestamp, ttl) VALUES (?, ?, ?, ?)',
+                         (key, json.dumps(value), int(time.time()), ttl))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+class RateLimiter:
+    """Thread-safe sliding-window rate limiter."""
+
+    def __init__(self, max_requests, period=1):
+        self.max_requests = max_requests
+        self.period = period
+        self.requests = []
+        self.lock = threading.Lock()
+
+    def wait(self):
+        with self.lock:
+            now = time.time()
+            self.requests = [t for t in self.requests if now - t < self.period]
+            if len(self.requests) >= self.max_requests:
+                sleep_time = self.period - (now - self.requests[0])
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+            self.requests.append(time.time())
+
+response_cache = Cache()
+api_limiter = RateLimiter(5, 1)
 
 def log_print(text):
     """Print to the console and store a colour-free copy for the report."""
@@ -118,13 +206,16 @@ def print_progress(iteration, total, bar_length=25):
         print()
 
 def robust_http_get(url, headers=None, timeout=8, retries=3):
-    """GET request with automatic retries; returns None on failure."""
+    """GET with User-Agent rotation and exponential backoff; None on failure."""
+    base_headers = {'User-Agent': random.choice(USER_AGENTS)}
+    if headers:
+        base_headers.update(headers)
     for attempt in range(retries):
         try:
-            return requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+            return requests.get(url, headers=base_headers, timeout=timeout, allow_redirects=True)
         except requests.exceptions.RequestException:
             if attempt < retries - 1:
-                time.sleep(2)
+                time.sleep(2 ** attempt)
             else:
                 return None
 
@@ -221,16 +312,46 @@ def watchdog_platforms():
 
 # ============================================================
 # MODULE: PHONE
-# Generates manual investigation links for a phone number:
-# Google Dorks (documents, social networks, paste sites) and
-# messaging/caller-ID lookups (WhatsApp, Telegram, Truecaller,
-# Sync.me). These require the browser because such services
-# cannot be queried reliably from a script.
+# Offline number analysis via the phonenumbers library
+# (validity, country, carrier, line type — no API keys, no
+# network calls), followed by manual investigation links:
+# Google Dorks and messaging/caller-ID lookups (WhatsApp,
+# Telegram, Truecaller, Sync.me).
 # ============================================================
 
 def investigate_phone(number):
     print_section(f"📱 PHONE NUMBER INVESTIGATION: {number}")
     digits_only = re.sub(r'\D', '', number)
+
+    print_section("📶 NUMBER ANALYSIS (OFFLINE)")
+    try:
+        import phonenumbers
+        from phonenumbers import carrier as pn_carrier, geocoder as pn_geocoder
+        try:
+            parsed = phonenumbers.parse(number, None)
+            valid = phonenumbers.is_valid_number(parsed)
+            e164 = phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)
+            country = phonenumbers.region_code_for_number(parsed) or "Unknown"
+            operator = pn_carrier.name_for_number(parsed, "en") or "Unknown"
+            location = pn_geocoder.description_for_number(parsed, "en") or "Unknown"
+            type_map = {
+                phonenumbers.PhoneNumberType.MOBILE: "Mobile",
+                phonenumbers.PhoneNumberType.FIXED_LINE: "Fixed line",
+                phonenumbers.PhoneNumberType.VOIP: "VoIP",
+                phonenumbers.PhoneNumberType.FIXED_LINE_OR_MOBILE: "Fixed/Mobile",
+                phonenumbers.PhoneNumberType.TOLL_FREE: "Toll-free",
+            }
+            ltype = type_map.get(phonenumbers.number_type(parsed), "Unknown")
+            mark = f"{Fore.GREEN}[✅]" if valid else f"{Fore.RED}[❌]"
+            log_print(f"  {mark}{Fore.WHITE} Valid: {Fore.YELLOW}{'YES' if valid else 'NO'}{Fore.WHITE}  ({e164})")
+            log_print(f"  {Fore.WHITE}Country: {Fore.YELLOW}{country}{Fore.WHITE}  Operator: {Fore.YELLOW}{operator}")
+            log_print(f"  {Fore.WHITE}Location: {Fore.YELLOW}{location}{Fore.WHITE}  Type: {Fore.YELLOW}{ltype}")
+            json_results['phone'] = {'e164': e164, 'valid': valid, 'country': country,
+                                     'operator': operator, 'location': location, 'type': ltype}
+        except phonenumbers.NumberParseException:
+            log_print(f"  {Fore.RED}[❌]{Fore.WHITE} Invalid number — could not be parsed.")
+    except ImportError:
+        log_print(f"  {Fore.YELLOW}[ℹ️] phonenumbers not installed — run: pip install phonenumbers")
 
     print_section("🔍 DEEP SEARCH (GOOGLE DORKS)")
     log_print(f"  {Fore.YELLOW}Use the links in the browser to force Google to find data:\n")
@@ -260,9 +381,51 @@ def investigate_phone(number):
 # Full email investigation: associated accounts via Holehe
 # (password-recovery probing across ~120 websites), identity
 # metadata via Gravatar, reputation and leak exposure via
-# EmailRep, plus targeted Google Dorks for profiles, forums,
-# configuration files and server logs.
+# EmailRep, DNS-level security analysis (MX, SPF, DKIM, DMARC)
+# via dnspython — all keyless — plus targeted Google Dorks.
 # ============================================================
+
+def check_email_dns(email):
+    """DNS-level analysis of the email's domain (MX, SPF, DKIM, DMARC).
+    Detects non-existent domains (no MX) and spoofing risk. Keyless."""
+    domain = email.split('@')[-1].lower()
+    result = {'domain': domain, 'mx': [], 'spf': False, 'dkim': False,
+              'dmarc': False, 'spoofing_risk': 'unknown'}
+    cached = response_cache.get(f"dns:{domain}")
+    if cached:
+        return cached
+    try:
+        import dns.resolver
+    except ImportError:
+        result['error'] = 'dnspython not installed'
+        return result
+    try:
+        for mx in dns.resolver.resolve(domain, 'MX', lifetime=5):
+            result['mx'].append(str(mx.exchange).rstrip('.'))
+    except Exception:
+        pass
+    try:
+        for txt in dns.resolver.resolve(domain, 'TXT', lifetime=5):
+            if 'v=spf1' in str(txt):
+                result['spf'] = True
+                break
+    except Exception:
+        pass
+    try:
+        dns.resolver.resolve(f"_dmarc.{domain}", 'TXT', lifetime=5)
+        result['dmarc'] = True
+    except Exception:
+        pass
+    try:
+        dns.resolver.resolve(f"_domainkey.{domain}", 'TXT', lifetime=5)
+        result['dkim'] = True
+    except Exception:
+        pass
+    if result['mx']:
+        score = sum([result['spf'], result['dkim'], result['dmarc']])
+        result['spoofing_risk'] = 'high' if score < 2 else 'medium' if score == 2 else 'low'
+    response_cache.set(f"dns:{domain}", result, ttl=86400)
+    return result
 
 def investigate_email(email):
     print_section(f"📧 EMAIL INVESTIGATION: {email}")
@@ -286,6 +449,7 @@ def investigate_email(email):
 
         proc.wait()
         print_progress(TOTAL, TOTAL)
+        json_results['email_holehe_count'] = len(found)
 
         if found:
             log_print(f"\n{Fore.GREEN}[+] ASSOCIATED ACCOUNTS FOUND:\n")
@@ -318,6 +482,7 @@ def investigate_email(email):
     log_print(f"     {Fore.BLUE}https://www.gravatar.com/avatar/{email_hash}?s=400")
 
     print_section("🛡️ EMAIL REPUTATION (EMAILREP)")
+    api_limiter.wait()
     rep_url = f"https://emailrep.io/{email}"
     rep_resp = robust_http_get(rep_url, timeout=8, retries=1)
     if rep_resp and rep_resp.status_code == 200:
@@ -332,6 +497,24 @@ def investigate_email(email):
             pass
     else:
         log_print(f"  {Fore.YELLOW}  [ℹ️] EmailRep rate limited the request.")
+
+    print_section("📋 DNS & SPOOFING ANALYSIS (MX/SPF/DKIM/DMARC)")
+    dnsr = check_email_dns(email)
+    json_results['email_dns'] = dnsr
+    if 'error' in dnsr:
+        log_print(f"  {Fore.YELLOW}[ℹ️] {dnsr['error']} — run: pip install dnspython")
+    else:
+        if dnsr['mx']:
+            log_print(f"  {Fore.GREEN}[✅]{Fore.WHITE} MX servers: {Fore.YELLOW}{', '.join(dnsr['mx'][:2])}")
+        else:
+            log_print(f"  {Fore.RED}[❌]{Fore.WHITE} No MX records — domain cannot receive mail (non-existent address?)")
+        spf = f"{Fore.GREEN}✅" if dnsr['spf'] else f"{Fore.RED}❌"
+        dkim = f"{Fore.GREEN}✅" if dnsr['dkim'] else f"{Fore.RED}❌"
+        dmarc = f"{Fore.GREEN}✅" if dnsr['dmarc'] else f"{Fore.RED}❌"
+        risk = dnsr['spoofing_risk']
+        rcolor = Fore.GREEN if risk == 'low' else Fore.YELLOW if risk == 'medium' else Fore.RED
+        log_print(f"  {Fore.WHITE}SPF: {spf}{Fore.WHITE}  DKIM: {dkim}{Fore.WHITE}  DMARC: {dmarc}")
+        log_print(f"  {Fore.WHITE}Spoofing risk: {rcolor}{risk.upper()}{Fore.WHITE} (sender impersonation)")
 
     print_section("🔍 DEEP SEARCH (GOOGLE DORKS)")
     log_print(f"  {Fore.YELLOW}Use the links in the browser to find data:\n")
@@ -352,7 +535,8 @@ def investigate_email(email):
 # Each platform is probed in parallel (25 threads); a profile is
 # reported when the response does not match the platform's known
 # "not found" signature (status code, error message or redirect
-# URL). Also generates Namechk and Wayback Machine history links.
+# URL). Results are cached in SQLite for one hour. Also generates
+# Namechk and Wayback Machine history links.
 # ============================================================
 
 def check_platform_thread(name, data, username):
@@ -362,8 +546,12 @@ def check_platform_thread(name, data, username):
     if not url:
         return None
 
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-    resp = robust_http_get(url, headers=headers, timeout=4, retries=1)
+    cache_key = f"plat:{url}"
+    cached = response_cache.get(cache_key)
+    if cached is not None:
+        return cached.get("line")
+
+    resp = robust_http_get(url, timeout=4, retries=1)
     if not resp:
         return None
 
@@ -374,15 +562,20 @@ def check_platform_thread(name, data, username):
     try:
         if error_type == "status_code":
             if resp.status_code == error_code:
+                response_cache.set(cache_key, {"line": None}, ttl=3600)
                 return None
         elif error_type == "message":
             if error_msg and error_msg in resp.text:
+                response_cache.set(cache_key, {"line": None}, ttl=3600)
                 return None
         elif error_type == "response_url":
             if error_msg and error_msg in resp.url:
+                response_cache.set(cache_key, {"line": None}, ttl=3600)
                 return None
 
-        return f"  {Fore.GREEN}[✅]{Fore.WHITE} [{name}] {Fore.CYAN}[Username]{Fore.WHITE} -> {Fore.YELLOW}{url}"
+        line = f"  {Fore.GREEN}[✅]{Fore.WHITE} [{name}] {Fore.CYAN}[Username]{Fore.WHITE} -> {Fore.YELLOW}{url}"
+        response_cache.set(cache_key, {"line": line}, ttl=3600)
+        return line
     except:
         return None
 
@@ -406,6 +599,7 @@ def investigate_username(username):
                 found.append(result)
 
     print_progress(total, total)
+    json_results['username_found'] = re.findall(r'->\s*(https?://\S+)', '\n'.join(found))
     if found:
         log_print(f"\n{Fore.GREEN}[+] PROFILES FOUND:\n")
         for s in found:
@@ -432,8 +626,30 @@ def investigate_username(username):
 # MODULE: DOMAIN
 # Domain investigation via certificate transparency: queries
 # crt.sh for all certificates issued for the domain and its
-# subdomains, revealing internal hostnames and forgotten services.
+# subdomains, revealing internal hostnames and forgotten
+# services. Complemented by a keyless HTTP security-headers
+# check (HSTS, CSP, X-Frame-Options, etc.).
 # ============================================================
+
+def check_domain_security(domain):
+    """HTTP security headers check — no API keys needed."""
+    checks = {
+        'Strict-Transport-Security': ('HSTS missing', 15),
+        'Content-Security-Policy': ('CSP missing', 10),
+        'X-Content-Type-Options': ('X-Content-Type-Options missing', 5),
+        'X-Frame-Options': ('X-Frame-Options missing', 5),
+        'Referrer-Policy': ('Referrer-Policy missing', 5),
+    }
+    result = {'score': 100, 'issues': []}
+    resp = robust_http_get(f"https://{domain}", timeout=10, retries=1)
+    if not resp or resp.status_code >= 400:
+        result['note'] = 'site unreachable over HTTPS'
+        return result
+    for header, (message, penalty) in checks.items():
+        if header not in resp.headers:
+            result['issues'].append(message)
+            result['score'] -= penalty
+    return result
 
 def investigate_domain(domain):
     print_section(f"🌐 DOMAIN INVESTIGATION: {domain}")
@@ -454,10 +670,22 @@ def investigate_domain(domain):
                     log_print(f"     {Fore.YELLOW}- {sub}")
             else:
                 log_print(f"\n{Fore.RED}  [❌] No subdomains found.")
+            json_results['domain_subdomains'] = len(subdomains)
         except:
             log_print(f"\n{Fore.RED}  [❌] Error in crt.sh.")
     else:
         log_print(f"\n{Fore.RED}  [❌] No certificates found.")
+
+    print_section("🛡️ SECURITY HEADERS (HSTS/CSP)")
+    sec = check_domain_security(domain)
+    json_results['domain_security'] = sec
+    if 'note' in sec:
+        log_print(f"  {Fore.YELLOW}[ℹ️] {sec['note']}.")
+    else:
+        scolor = Fore.GREEN if sec['score'] >= 70 else Fore.YELLOW if sec['score'] >= 40 else Fore.RED
+        log_print(f"  {Fore.WHITE}Security score: {scolor}{sec['score']}/100")
+        for issue in sec['issues'][:5]:
+            log_print(f"     {Fore.YELLOW}⚠️ {issue}")
 
 # ============================================================
 # MODULE: LEAKS & PASSWORDS
@@ -539,6 +767,7 @@ def investigate_leaks(target, target_type):
             pass
 
     print_progress(3, steps)
+    json_results['leaks_found'] = len(found)
 
     if found:
         log_print(f"\n{Fore.RED}[!] PUBLIC LEAKS FOUND:\n")
@@ -647,6 +876,7 @@ def fake_profile_scanner(target, target_type):
     # Normalize score
     if score > 100:
         score = 100
+    json_results['fake_score'] = score
 
     if score >= 70:
         risk = f"{Fore.RED}HIGH RISK{Fore.WHITE}"
@@ -739,6 +969,7 @@ def dark_web_scan(target, target_type, tor_port=None):
     for name, url in links:
         log_print(f"     {Fore.BLUE}{url}")
 
+    json_results['darkweb_found'] = len(found)
     if found:
         log_print(f"\n{Fore.RED}[!] DARK WEB LEADS FOUND:\n")
         for s in found:
@@ -778,10 +1009,11 @@ def tor_get(url, timeout=20, port=9050):
 # ============================================================
 # DEPENDENCY CHECKER (AUTO-INSTALL)
 # Verifies at startup that all required packages are importable
-# (requests, colorama, pysocks, holehe) and automatically installs
-# any missing ones via pip, then re-checks. In auto mode (startup)
-# it runs without any user interaction; in interactive mode it
-# also reports the Tor status and prompts before installing.
+# (requests, colorama, pysocks, holehe, dnspython, phonenumbers)
+# and automatically installs any missing ones via pip, then
+# re-checks. In auto mode (startup) it runs without any user
+# interaction; in interactive mode it also reports the Tor status
+# and prompts before installing.
 # ============================================================
 
 REQUIRED_PACKAGES = [
@@ -789,6 +1021,8 @@ REQUIRED_PACKAGES = [
     ("colorama", "colorama"),
     ("socks", "pysocks"),
     ("holehe", "holehe"),
+    ("dns", "dnspython"),
+    ("phonenumbers", "phonenumbers"),
 ]
 
 def check_dependencies(auto=False):
@@ -991,29 +1225,100 @@ def show_about():
 # Core investigation pipeline. Detects the Tor client, identifies
 # the target type (email, domain, phone or username), runs the
 # specialised module, then the shared modules (leaks, fake profile
-# scanner, dark web scan) and finally saves the .txt report with
-# a timestamped filename.
+# scanner, dark web scan), computes the aggregated Digital
+# Exposure Score and finally saves the .txt and .json reports
+# with timestamped filenames.
 # ============================================================
+
+def overall_assessment():
+    """Aggregated exposure score across every module (0-100).
+    Combines footprint size (profiles, accounts), leak exposure,
+    dark web matches and the Fake Profile Scanner score into a
+    single LOW/MEDIUM/HIGH assessment recorded in the report."""
+    print_section("🧮 OVERALL ASSESSMENT")
+    score = 0
+    reasons = []
+
+    profiles = json_results.get('username_found', [])
+    if profiles:
+        pts = min(40, len(profiles) * 2)
+        score += pts
+        reasons.append(f"{len(profiles)} profiles found across platforms (+{pts})")
+
+    holehe = json_results.get('email_holehe_count', 0)
+    if holehe:
+        pts = min(20, holehe * 2)
+        score += pts
+        reasons.append(f"{holehe} associated email accounts (+{pts})")
+
+    if json_results.get('leaks_found'):
+        score += 20
+        reasons.append("Public leaks found (+20)")
+
+    if json_results.get('darkweb_found'):
+        score += 20
+        reasons.append("Dark web leads found (+20)")
+
+    fake = json_results.get('fake_score', 0)
+    if fake:
+        pts = int(fake * 0.2)
+        score += pts
+        reasons.append(f"Fake profile indicators (+{pts})")
+
+    dns = json_results.get('email_dns', {})
+    if dns and not dns.get('mx', ['x']):
+        score += 10
+        reasons.append("Domain without MX records (+10)")
+
+    sec = json_results.get('domain_security', {})
+    if sec and sec.get('score', 100) < 70:
+        score += 10
+        reasons.append("Weak domain security headers (+10)")
+
+    score = min(100, score)
+    band = 'HIGH' if score >= 70 else 'MEDIUM' if score >= 40 else 'LOW'
+    color = Fore.RED if score >= 70 else Fore.YELLOW if score >= 40 else Fore.GREEN
+    log_print(f"  {Fore.WHITE}Digital Exposure Score: {color}{score}/100{Fore.WHITE} ({color}{band} EXPOSURE{Fore.WHITE})")
+    if reasons:
+        log_print(f"  {Fore.CYAN}Contributing factors:")
+        for r in reasons:
+            log_print(f"    - {Fore.WHITE}{r}")
+    else:
+        log_print(f"  {Fore.GREEN}Minimal digital footprint detected.")
+    json_results['overall'] = {'score': score, 'band': band, 'reasons': reasons}
 
 def save_report(target):
     global report_buffer
     date = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     safe = re.sub(r'[^a-zA-Z0-9.@_-]', '', target)
     filename = f"report_{safe}_{date}.txt"
+    now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     try:
         with open(filename, 'w', encoding='utf-8') as f:
             f.write(f"--- OSINT Report: {target} ---\n")
-            f.write(f"Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            f.write(f"Date: {now}\n\n")
             for l in report_buffer:
                 f.write(l + "\n")
         log_print(f"\n{Fore.GREEN}[+] Report: {filename}")
+
+        json_filename = filename.replace('.txt', '.json')
+        payload = {
+            'target': target,
+            'date': now,
+            'results': json_results,
+            'log': report_buffer,
+        }
+        with open(json_filename, 'w', encoding='utf-8') as jf:
+            json.dump(payload, jf, indent=2, ensure_ascii=False)
+        log_print(f"{Fore.GREEN}[+] JSON report: {json_filename}")
     except Exception as e:
         print(f"{Fore.RED}[!] Failed to save report: {e}")
     report_buffer = []
 
 def investigate_all(target):
-    global report_buffer
+    global report_buffer, json_results
     report_buffer = []
+    json_results = {}
     clear_screen()
 
     tor_port = check_tor_connection()
@@ -1026,9 +1331,11 @@ def investigate_all(target):
 
     print_section("🔌 TOR CLIENT STATUS")
     if tor_port:
+        json_results['tor_connected'] = True
         log_print(f"  {Fore.GREEN}[✅] Tor Browser/client: {Fore.GREEN}CONNECTED{Fore.WHITE} (SOCKS5 127.0.0.1:{tor_port})")
         log_print(f"  {Fore.WHITE}Advanced dark web scan {Fore.GREEN}enabled{Fore.WHITE}.")
     else:
+        json_results['tor_connected'] = False
         log_print(f"  {Fore.RED}[❌] Tor Browser/client: {Fore.RED}DISCONNECTED{Fore.WHITE}")
         log_print(f"  {Fore.YELLOW}[⚠️] Dark web scan running in limited clearnet mode.")
 
@@ -1049,16 +1356,17 @@ def investigate_all(target):
     fake_profile_scanner(target, target_type)
     dark_web_scan(target, target_type, tor_port=tor_port)
 
+    overall_assessment()
     print_dynamic_box([f"{Fore.MAGENTA} Analysis Complete."])
     save_report(target)
 
 # ============================================================
 # MENU
 # Application entry point. On startup it automatically checks and
-# installs dependencies, updates the platform database and reports
-# the Tor status, then presents the main menu (Search, Manage
-# Reports, About, Exit). Every investigation flows through
-# investigate_all() above.
+# installs dependencies, updates the platform database, offers to
+# collect the IntelX key and reports the Tor status, then presents
+# the main menu (Search, Manage Reports, About, Exit). Every
+# investigation flows through investigate_all() above.
 # ============================================================
 
 def main():
